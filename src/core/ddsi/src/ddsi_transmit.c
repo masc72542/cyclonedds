@@ -421,6 +421,15 @@ static void transmit_sample_lgmsg_unlocks_wr (struct ddsi_xpack *xp, struct ddsi
   }
 }
 
+/**
+ * xp: 传输事件上下文，用于发送消息。
+ * wr: 写者对象。
+ * whcst: Writer History Cache 状态（可选，用于心跳控制）。
+ * seq: 样本序列号。
+ * serdata: 待发送的序列化数据。
+ * prd: 代理读者对象，若非 NULL 表示单独发送给这个读者。
+ * isnew: 是否是新写入样本（非重传）。
+ */
 static void transmit_sample_unlocks_wr (struct ddsi_xpack *xp, struct ddsi_writer *wr, const struct ddsi_whc_state *whcst, ddsi_seqno_t seq, struct ddsi_serdata *serdata, struct ddsi_proxy_reader *prd, int isnew)
 {
   /* on entry: &wr->e.lock held; on exit: lock no longer held */
@@ -431,36 +440,41 @@ static void transmit_sample_unlocks_wr (struct ddsi_xpack *xp, struct ddsi_write
   assert(xp);
   assert((wr->heartbeat_xevent != NULL) == (whcst != NULL));
 
-  sz = ddsi_serdata_size (serdata);
+  sz = ddsi_serdata_size (serdata); /* 样本超过分片大小 → 需要分片;不是新样本 → 重传需要分片;发送给单个代理读者 → 可能分片;OMG 规范保护子消息（submessage protected） → 需要分片。*/
   if (sz > gv->config.fragment_size || !isnew || prd != NULL || ddsi_omg_writer_is_submessage_protected (wr))
   {
     assert (wr->init_burst_size_limit <= UINT32_MAX - UINT16_MAX);
     assert (wr->rexmit_burst_size_limit <= UINT32_MAX - UINT16_MAX);
     const uint32_t max_burst_size = isnew ? wr->init_burst_size_limit : wr->rexmit_burst_size_limit;
     const uint32_t nfrags = (sz + gv->config.fragment_size - 1) / gv->config.fragment_size;
-    uint32_t nfrags_lim;
-    if (sz <= max_burst_size || wr->num_reliable_readers != wr->num_readers)
+    uint32_t nfrags_lim; /* 计算分片数量与发送限制 */
+    if (sz <= max_burst_size || wr->num_reliable_readers != wr->num_readers) /* 可以全部发送 */
       nfrags_lim = nfrags; // if it fits or if there are best-effort readers, send it in its entirety
     else
       nfrags_lim = (max_burst_size + gv->config.fragment_size - 1) / gv->config.fragment_size;
 
+    /* nfrags_lim: 本次发送最大分片数，避免一次性发送太多，防止拥塞 */
+    /* 对可靠读者，严格遵守 burst 限制；对最佳努力读者或小样本，则直接发送。 */
+
+    /* 负责把样本切片成消息 (xmsg) 并添加到 xp */
+    /* 注意：函数名带 _unlock_wr，意味着锁仍然在这里持有。 */
     transmit_sample_lgmsg_unlocks_wr (xp, wr, seq, serdata, prd, isnew, nfrags, nfrags_lim);
   }
-  else
+  else /* 样本小于分片限制且不需要特殊处理 → 创建一个完整消息直接发送。 */
   {
     struct ddsi_xmsg *fmsg;
     if (ddsi_create_fragment_message_simple (wr, seq, serdata, &fmsg) >= 0)
       ddsi_xpack_addmsg (xp, fmsg, 0);
   }
 
-  if (wr->heartbeat_xevent)
+  if (wr->heartbeat_xevent) /* 如果启用了心跳控制，将心跳消息 piggyback 到当前包中。*/
     hmsg = ddsi_writer_hbcontrol_piggyback (wr, whcst, serdata->twrite, ddsi_xpack_packetid (xp), &hbansreq);
   ddsrt_mutex_unlock (&wr->e.lock);
 
   if(hmsg)
-    ddsi_xpack_addmsg (xp, hmsg, 0);
+    ddsi_xpack_addmsg (xp, hmsg, 0); /* 心跳消息单独加入到传输上下文。 */
   if (hbansreq >= DDSI_HBC_ACK_REQ_YES_AND_FLUSH)
-    ddsi_xpack_send (xp, true);
+    ddsi_xpack_send (xp, true); /* 根据心跳控制策略，如果需要立即 flush，则调用发送。 */
 }
 
 void ddsi_enqueue_spdp_sample_wrlock_held (struct ddsi_writer *wr, ddsi_seqno_t seq, struct ddsi_serdata *serdata, struct ddsi_proxy_reader *prd)
@@ -785,6 +799,7 @@ int ddsi_write_sample_p2p_wrlock_held(struct ddsi_writer *wr, ddsi_seqno_t seq, 
     }
   }
 
+  // 插入样本到 WHC
   if ((r = insert_sample_in_whc (wr, seq, serdata, tk)) >= 0)
   {
     ddsi_enqueue_sample_wrlock_held (wr, seq, serdata, prd, 1);
@@ -843,22 +858,22 @@ static int write_sample (struct ddsi_thread_state * const thrst, struct ddsi_xpa
   /* If WHC overfull, block. */
   {
     struct ddsi_whc_state whcst;
-    ddsi_whc_get_state(wr->whc, &whcst);
-    if (whcst.unacked_bytes > wr->whc_high)
+    ddsi_whc_get_state(wr->whc, &whcst); /* 检查 WHC（Writer History Cache）是否满 */
+    if (whcst.unacked_bytes > wr->whc_high) /* 如果未确认的字节数超限，根据策略进行： */
     {
       dds_return_t ores;
       assert(gc_allowed); /* also see beginning of the function */
       if (gv->config.prioritize_retransmit && wr->retransmitting)
-        ores = throttle_writer (thrst, xp, wr);
+        ores = throttle_writer (thrst, xp, wr); /* 阻塞直到可以写入 (throttle_writer) */
       else
       {
-        maybe_grow_whc (wr);
+        maybe_grow_whc (wr); /* 或尝试扩容 WHC (maybe_grow_whc) */
         if (whcst.unacked_bytes <= wr->whc_high)
           ores = DDS_RETCODE_OK;
         else
           ores = throttle_writer (thrst, xp, wr);
       }
-      if (ores == DDS_RETCODE_TIMEOUT)
+      if (ores == DDS_RETCODE_TIMEOUT) /* 如果超时，则返回 DDS_RETCODE_TIMEOUT。 */
       {
         ddsrt_mutex_unlock (&wr->e.lock);
         r = DDS_RETCODE_TIMEOUT;
@@ -867,9 +882,9 @@ static int write_sample (struct ddsi_thread_state * const thrst, struct ddsi_xpa
     }
   }
 
-  if (wr->state != WRST_OPERATIONAL)
+  if (wr->state != WRST_OPERATIONAL) /* 检查 Writer 状态 */
   {
-    r = DDS_RETCODE_PRECONDITION_NOT_MET;
+    r = DDS_RETCODE_PRECONDITION_NOT_MET; /* 如果不在操作状态，返回 DDS_RETCODE_PRECONDITION_NOT_MET */
     ddsrt_mutex_unlock (&wr->e.lock);
     goto drop;
   }
@@ -878,20 +893,20 @@ static int write_sample (struct ddsi_thread_state * const thrst, struct ddsi_xpa
   tnow = ddsrt_time_monotonic ();
   serdata->twrite = tnow;
 
-  seq = ++wr->seq;
+  seq = ++wr->seq; /* 生成序列号 & 更新时间戳 */
   wr->sent_bytes += ddsi_serdata_size (serdata);
-  if ((r = insert_sample_in_whc (wr, seq, serdata, tk)) < 0)
+  if ((r = insert_sample_in_whc (wr, seq, serdata, tk)) < 0) /* 插入样本到 WHC */
   {
     /* Failure of some kind */
-    ddsrt_mutex_unlock (&wr->e.lock);
+    ddsrt_mutex_unlock (&wr->e.lock); /* 如果失败，直接解锁返回。 */
   }
-  else if (wr->test_drop_outgoing_data)
+  else if (wr->test_drop_outgoing_data) /* 如果 wr->test_drop_outgoing_data 为真，则仅更新序号，不发送。 */
   {
-    GVTRACE ("test_drop_outgoing_data");
+    GVTRACE ("test_drop_outgoing_data"); /* 用于模拟丢包或测试 */
     ddsi_writer_update_seq_xmit (wr, seq);
     ddsrt_mutex_unlock (&wr->e.lock);
   }
-  else if (ddsi_addrset_empty (wr->as))
+  else if (ddsi_addrset_empty (wr->as)) /* 无网络目的地（无读者），仅记录序号，不发送。 */
   {
     /* No network destination, so no point in doing all the work involved
        in going all the way.  We do have to record that we "transmitted"
@@ -902,7 +917,7 @@ static int write_sample (struct ddsi_thread_state * const thrst, struct ddsi_xpa
     ddsi_writer_update_seq_xmit (wr, seq);
     ddsrt_mutex_unlock (&wr->e.lock);
   }
-  else
+  else /* 有网络目的地： */
   {
     /* Note the subtlety of enqueueing with the lock held but
        transmitting without holding the lock. Still working on
@@ -917,14 +932,14 @@ static int write_sample (struct ddsi_thread_state * const thrst, struct ddsi_xpa
         ddsi_whc_get_state(wr->whc, &whcst);
         whcstptr = &whcst;
       }
-      transmit_sample_unlocks_wr (xp, wr, whcstptr, seq, serdata, NULL, 1);
+      transmit_sample_unlocks_wr (xp, wr, whcstptr, seq, serdata, NULL, 1); /* 如果xp不为空，通过transmit_sample_unlocks_wr发送 */
     }
     else
     {
-      if (wr->heartbeat_xevent)
+      if (wr->heartbeat_xevent) /* 处理心跳。 */
         ddsi_writer_hbcontrol_note_asyncwrite (wr, tnow);
       if (wr->e.guid.entityid.u == DDSI_ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER)
-        ddsi_enqueue_spdp_sample_wrlock_held(wr, seq, serdata, NULL);
+        ddsi_enqueue_spdp_sample_wrlock_held(wr, seq, serdata, NULL); /* 如果是SPDP writer, SPDP是DDS特殊内置写者，用于发现Participant */
       else
         ddsi_enqueue_sample_wrlock_held (wr, seq, serdata, NULL, 1);
       ddsrt_mutex_unlock (&wr->e.lock);
@@ -933,18 +948,18 @@ static int write_sample (struct ddsi_thread_state * const thrst, struct ddsi_xpa
 
 drop:
   /* FIXME: shouldn't I move the ddsi_serdata_unref call to the callers? */
-  ddsi_serdata_unref (serdata);
+  ddsi_serdata_unref (serdata); /* 释放 serdata 引用 */
   return r;
 }
 
 int ddsi_write_sample_gc (struct ddsi_thread_state * const thrst, struct ddsi_xpack *xp, struct ddsi_writer *wr, struct ddsi_serdata *serdata, struct ddsi_tkmap_instance *tk)
 {
-  return write_sample (thrst, xp, wr, serdata, tk, 1);
+  return write_sample (thrst, xp, wr, serdata, tk, 1); /* gc_allowed = 1 → 写入时允许阻塞或触发 WHC 扩容/垃圾回收。 */
 }
 
 int ddsi_write_sample_nogc (struct ddsi_thread_state * const thrst, struct ddsi_xpack *xp, struct ddsi_writer *wr, struct ddsi_serdata *serdata, struct ddsi_tkmap_instance *tk)
 {
-  return write_sample (thrst, xp, wr, serdata, tk, 0);
+  return write_sample (thrst, xp, wr, serdata, tk, 0); /* gc_allowed = 0 → 写入必须立即完成，不允许阻塞。 */
 }
 
 int ddsi_write_sample_gc_notk (struct ddsi_thread_state * const thrst, struct ddsi_xpack *xp, struct ddsi_writer *wr, struct ddsi_serdata *serdata)

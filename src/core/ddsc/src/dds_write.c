@@ -807,16 +807,16 @@ static dds_return_t dds_write_impl_psmxloan_serdata (struct dds_writer *wr, cons
 
 dds_return_t dds_write_impl (dds_writer *wr, const void *data, dds_time_t timestamp, dds_write_action action)
 {
-  struct ddsi_thread_state * const thrst = ddsi_lookup_thread_state ();
-  const enum ddsi_serdata_kind sdkind = (action & DDS_WR_KEY_BIT) ? SDK_KEY : SDK_DATA;
+  struct ddsi_thread_state * const thrst = ddsi_lookup_thread_state (); /* thrst：获取线程状态 */
+  const enum ddsi_serdata_kind sdkind = (action & DDS_WR_KEY_BIT) ? SDK_KEY : SDK_DATA; /* sdkind：样本类型（Key 或 Data） */
   const uint32_t statusinfo =
     (((action & DDS_WR_DISPOSE_BIT) ? DDSI_STATUSINFO_DISPOSE : 0) |
      ((action & DDS_WR_UNREGISTER_BIT) ? DDSI_STATUSINFO_UNREGISTER : 0));
 
-  if (!dds_source_timestamp_is_valid_ddsi_time (timestamp, wr->protocol_version))
+  if (!dds_source_timestamp_is_valid_ddsi_time (timestamp, wr->protocol_version)) /* 确保时间戳在协议允许范围内 */
     return DDS_RETCODE_BAD_PARAMETER;
 
-  if (!evaluate_topic_filter (wr, data, sdkind))
+  if (!evaluate_topic_filter (wr, data, sdkind)) /* 如果数据不匹配 Topic Filter，直接返回 OK（跳过写入）。 */
     return DDS_RETCODE_OK;
 
   // I. psmx loan => assert (psmx && is_memcpy_safe)
@@ -851,7 +851,7 @@ dds_return_t dds_write_impl (dds_writer *wr, const void *data, dds_time_t timest
   //       - deliver serdata
   //   c. no psmx
   //     - ddsi_serdata_from_sample, deliver serdata
-  ddsi_thread_state_awake (thrst, &wr->m_entity.m_domain->gv);
+  ddsi_thread_state_awake (thrst, &wr->m_entity.m_domain->gv); /* 标记线程为活跃，以便 WHC 或传输操作安全。 */
   struct ddsi_serdata *serdata;
   struct dds_loaned_sample *psmx_loan;
   // If the input is a keyed topic and there's a PSMX endpoint that wants the key value, then we
@@ -865,6 +865,11 @@ dds_return_t dds_write_impl (dds_writer *wr, const void *data, dds_time_t timest
   dds_return_t ret = DDS_RETCODE_OK;
   if ((ret = dds_write_impl_psmxloan_serdata (wr, data, sdkind, timestamp, statusinfo, &psmx_loan, &serdata, &loan_to_be_freed)) == DDS_RETCODE_OK)
   {
+    /**
+     * psmx_loan → PSMX 共享内存路径
+     * serdata → 普通 DDSI 网络发送路径
+     * loan_to_be_freed → heap loan，需要在发送后释放
+     */
     assert (psmx_loan != NULL || serdata != NULL);
     assert ((psmx_loan == NULL) == (wr->m_endpoint.psmx_endpoints.length == 0));
     assert (psmx_loan == NULL || psmx_loan->loan_origin.origin_kind == DDS_LOAN_ORIGIN_KIND_PSMX);
