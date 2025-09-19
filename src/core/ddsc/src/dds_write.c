@@ -869,6 +869,7 @@ dds_return_t dds_write_impl (dds_writer *wr, const void *data, dds_time_t timest
      * psmx_loan → PSMX 共享内存路径
      * serdata → 普通 DDSI 网络发送路径
      * loan_to_be_freed → heap loan，需要在发送后释放
+     * 返回 OK 时至少会有一个有效对象：psmx_loan 或 serdata
      */
     assert (psmx_loan != NULL || serdata != NULL);
     assert ((psmx_loan == NULL) == (wr->m_endpoint.psmx_endpoints.length == 0));
@@ -881,7 +882,7 @@ dds_return_t dds_write_impl (dds_writer *wr, const void *data, dds_time_t timest
       dds_write_impl_psmx_key_init (&key);
 
       const struct dds_psmx_endpoint_int *loan_source_ep = NULL;
-      for (uint32_t l = 0; l < wr->m_endpoint.psmx_endpoints.length; l++)
+      for (uint32_t l = 0; l < wr->m_endpoint.psmx_endpoints.length; l++) /* 遍历所有 PSMX endpoints： */
       {
         struct dds_psmx_endpoint_int const * const ep = wr->m_endpoint.psmx_endpoints.endpoints[l];
         if (psmx_loan->loan_origin.psmx_endpoint == ep->ext)
@@ -891,7 +892,7 @@ dds_return_t dds_write_impl (dds_writer *wr, const void *data, dds_time_t timest
           continue;
         }
 
-        if (ep->wants_key)
+        if (ep->wants_key) /* 对只需要 key 的 endpoint，生成 key blob。 */
         {
           dds_return_t ret2 = dds_write_impl_psmx_get_key (&key, wr->m_wr->type, data);
           if (ret2 != DDS_RETCODE_OK && ret == DDS_RETCODE_OK)
@@ -899,6 +900,7 @@ dds_return_t dds_write_impl (dds_writer *wr, const void *data, dds_time_t timest
           continue;
         }
 
+        /* 对普通 endpoint，分配 loan、拷贝、发送。*/
         struct dds_loaned_sample *loan_copy = ep->ops.request_loan (ep, psmx_loan->metadata->sample_size);
         if (loan_copy == NULL)
         {
